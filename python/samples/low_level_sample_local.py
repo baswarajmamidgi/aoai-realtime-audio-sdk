@@ -167,7 +167,7 @@ async def receive_messages(client: RTLowLevelClient):
                 print(f"  Response Id: {message.response.id}")
                 if message.response.status_details:
                     print(f"  Status Details: {message.response.status_details.model_dump_json()}")
-                break
+                # break
             case "response.output_item.added":
                 print("Response Output Item Added Message")
                 print(f"  Response Id: {message.response_id}")
@@ -209,6 +209,7 @@ async def receive_messages(client: RTLowLevelClient):
                 print(f"  Item Id: {message.item_id}")
                 print(f"  Audio Data Length: {len(message.delta)}")
                 audio_buffer += base64.b64decode(message.delta)
+
             case "response.audio.done":
                 print("Response Audio Done Message")
                 print(f"  Response Id: {message.response_id}")
@@ -216,6 +217,7 @@ async def receive_messages(client: RTLowLevelClient):
                 # Play the complete audio buffer
                 play_audio(audio_buffer)
                 audio_buffer = b''  # Reset the buffer
+                
             case "response.function_call_arguments.delta":
                 print("Response Function Call Arguments Delta Message")
                 print(f"  Response Id: {message.response_id}")
@@ -238,13 +240,14 @@ def get_env_var(var_name: str) -> str:
     return value
 
 
-async def with_azure_openai(audio_queue: queue.Queue):
+async def with_azure_openai(audio_queue: queue.Queue, stop_event: threading.Event):
     endpoint = get_env_var("AZURE_OPENAI_ENDPOINT")
     key = get_env_var("AZURE_OPENAI_API_KEY")
     deployment = get_env_var("AZURE_OPENAI_DEPLOYMENT")
     async with RTLowLevelClient(
         endpoint, key_credential=AzureKeyCredential(key), azure_deployment=deployment
     ) as client:
+        # Send the session update message once
         await client.send(
             SessionUpdateMessage(
                 session=SessionUpdateParams(
@@ -254,11 +257,12 @@ async def with_azure_openai(audio_queue: queue.Queue):
             )
         )
 
-        await asyncio.gather(stream_audio(client, audio_queue), receive_messages(client))
+        # Start streaming audio and receiving messages concurrently
+        await asyncio.gather(stream_audio(client, audio_queue, stop_event), receive_messages(client))
 
 
-async def stream_audio(client: RTLowLevelClient, audio_queue: queue.Queue):
-    while True:
+async def stream_audio(client: RTLowLevelClient, audio_queue: queue.Queue, stop_event: threading.Event):
+    while not stop_event.is_set():
         try:
             chunk = audio_queue.get_nowait()
             base64_audio = base64.b64encode(chunk).decode("utf-8")
@@ -285,6 +289,7 @@ def record_audio(audio_queue: queue.Queue, stop_event: threading.Event):
 
     while not stop_event.is_set():
         data = stream.read(CHUNK)
+        print("Recoding In Progress")
         audio_queue.put(data)
 
     print("Recording stopped.")
@@ -309,8 +314,10 @@ def create_gui():
             recording = True
             button.config(text="Stop Recording")
             stop_event.clear()
-            threading.Thread(target=record_audio, args=(audio_queue, stop_event)).start()
-            processing_thread = threading.Thread(target=run_azure_openai, args=(audio_queue,))
+            # Start the recording thread
+            threading.Thread(target=record_audio, args=(audio_queue, stop_event), daemon=True).start()
+            # Start the processing thread
+            processing_thread = threading.Thread(target=run_azure_openai, args=(audio_queue, stop_event), daemon=True)
             processing_thread.start()
         else:
             recording = False
@@ -331,8 +338,8 @@ def create_gui():
     return root, audio_queue
 
 
-def run_azure_openai(audio_queue):
-    asyncio.run(with_azure_openai(audio_queue))
+def run_azure_openai(audio_queue, stop_event):
+    asyncio.run(with_azure_openai(audio_queue, stop_event))
 
 
 if __name__ == "__main__":
