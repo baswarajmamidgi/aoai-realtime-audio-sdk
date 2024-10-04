@@ -5,6 +5,12 @@ import asyncio
 import base64
 import os
 import sys
+import tkinter as tk
+import pyaudio
+import threading
+import queue
+import io
+import wave
 
 import numpy as np
 import soundfile as sf
@@ -22,43 +28,42 @@ from rtclient import (
 )
 
 
-def resample_audio(audio_data, original_sample_rate, target_sample_rate):
-    number_of_samples = round(len(audio_data) * float(target_sample_rate) / original_sample_rate)
-    resampled_audio = resample(audio_data, number_of_samples)
-    return resampled_audio.astype(np.int16)
 
 
-async def send_audio(client: RTLowLevelClient, audio_file_path: str):
-    sample_rate = 24000
-    duration_ms = 100
-    samples_per_chunk = sample_rate * (duration_ms / 1000)
-    bytes_per_sample = 2
-    bytes_per_chunk = int(samples_per_chunk * bytes_per_sample)
-
-    extra_params = (
-        {
-            "samplerate": sample_rate,
-            "channels": 1,
-            "subtype": "PCM_16",
-        }
-        if audio_file_path.endswith(".raw")
-        else {}
-    )
-
-    audio_data, original_sample_rate = sf.read(audio_file_path, dtype="int16", **extra_params)
-
-    if original_sample_rate != sample_rate:
-        audio_data = resample_audio(audio_data, original_sample_rate, sample_rate)
-
-    audio_bytes = audio_data.tobytes()
-
-    for i in range(0, len(audio_bytes), bytes_per_chunk):
-        chunk = audio_bytes[i : i + bytes_per_chunk]
-        base64_audio = base64.b64encode(chunk).decode("utf-8")
-        await client.send(InputAudioBufferAppendMessage(audio=base64_audio))
+def play_audio(audio_data):
+    CHUNK = 1024
+    
+    # Create a wave file in memory
+    with io.BytesIO() as wav_buffer:
+        with wave.open(wav_buffer, 'wb') as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)  # Assuming 16-bit audio
+            wav_file.setframerate(24000)  # Assuming 24kHz sample rate
+            wav_file.writeframes(audio_data)
+        
+        wav_buffer.seek(0)
+        
+        # Play the audio
+        p = pyaudio.PyAudio()
+        stream = p.open(format=p.get_format_from_width(2),
+                        channels=1,
+                        rate=24000,
+                        output=True)
+        
+        wav_buffer.seek(44)  # Skip WAV header
+        data = wav_buffer.read(CHUNK)
+        
+        while data:
+            stream.write(data)
+            data = wav_buffer.read(CHUNK)
+        
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
 
 
 async def receive_messages(client: RTLowLevelClient):
+    audio_buffer = b''
     while not client.closed:
         message = await client.recv()
         if message is None:
@@ -203,10 +208,14 @@ async def receive_messages(client: RTLowLevelClient):
                 print(f"  Response Id: {message.response_id}")
                 print(f"  Item Id: {message.item_id}")
                 print(f"  Audio Data Length: {len(message.delta)}")
+                audio_buffer += base64.b64decode(message.delta)
             case "response.audio.done":
                 print("Response Audio Done Message")
                 print(f"  Response Id: {message.response_id}")
                 print(f"  Item Id: {message.item_id}")
+                # Play the complete audio buffer
+                play_audio(audio_buffer)
+                audio_buffer = b''  # Reset the buffer
             case "response.function_call_arguments.delta":
                 print("Response Function Call Arguments Delta Message")
                 print(f"  Response Id: {message.response_id}")
@@ -229,7 +238,7 @@ def get_env_var(var_name: str) -> str:
     return value
 
 
-async def with_azure_openai(audio_file_path: str):
+async def with_azure_openai(audio_queue: queue.Queue):
     endpoint = get_env_var("AZURE_OPENAI_ENDPOINT")
     key = get_env_var("AZURE_OPENAI_API_KEY")
     deployment = get_env_var("AZURE_OPENAI_DEPLOYMENT")
@@ -245,29 +254,89 @@ async def with_azure_openai(audio_file_path: str):
             )
         )
 
-        await asyncio.gather(send_audio(client, audio_file_path), receive_messages(client))
+        await asyncio.gather(stream_audio(client, audio_queue), receive_messages(client))
 
 
-async def with_openai(audio_file_path: str):
-    key = get_env_var("OPENAI_API_KEY")
-    model = get_env_var("OPENAI_MODEL")
-    async with RTLowLevelClient(key_credential=AzureKeyCredential(key), model=model) as client:
-        await client.send(
-            SessionUpdateMessage(session=SessionUpdateParams(turn_detection=ServerVAD(type="server_vad")))
-        )
+async def stream_audio(client: RTLowLevelClient, audio_queue: queue.Queue):
+    while True:
+        try:
+            chunk = audio_queue.get_nowait()
+            base64_audio = base64.b64encode(chunk).decode("utf-8")
+            await client.send(InputAudioBufferAppendMessage(audio=base64_audio))
+        except queue.Empty:
+            await asyncio.sleep(0.1)  # Short sleep to prevent busy-waiting
 
-        await asyncio.gather(send_audio(client, audio_file_path), receive_messages(client))
+
+def record_audio(audio_queue: queue.Queue, stop_event: threading.Event):
+    CHUNK = 1024
+    FORMAT = pyaudio.paInt16
+    CHANNELS = 1
+    RATE = 24000
+
+    p = pyaudio.PyAudio()
+
+    stream = p.open(format=FORMAT,
+                    channels=CHANNELS,
+                    rate=RATE,
+                    input=True,
+                    frames_per_buffer=CHUNK)
+
+    print("Recording...")
+
+    while not stop_event.is_set():
+        data = stream.read(CHUNK)
+        audio_queue.put(data)
+
+    print("Recording stopped.")
+
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
+
+
+def create_gui():
+    root = tk.Tk()
+    root.title("Audio Recorder")
+
+    recording = False
+    stop_event = threading.Event()
+    audio_queue = queue.Queue()
+    processing_thread = None
+
+    def toggle_recording():
+        nonlocal recording, processing_thread
+        if not recording:
+            recording = True
+            button.config(text="Stop Recording")
+            stop_event.clear()
+            threading.Thread(target=record_audio, args=(audio_queue, stop_event)).start()
+            processing_thread = threading.Thread(target=run_azure_openai, args=(audio_queue,))
+            processing_thread.start()
+        else:
+            recording = False
+            button.config(text="Start Recording")
+            stop_event.set()
+            if processing_thread:
+                processing_thread.join()
+
+    button = tk.Button(root, text="Start Recording", command=toggle_recording)
+    button.pack(pady=20)
+
+    def on_closing():
+        if recording:
+            stop_event.set()
+        root.quit()
+
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    return root, audio_queue
+
+
+def run_azure_openai(audio_queue):
+    asyncio.run(with_azure_openai(audio_queue))
 
 
 if __name__ == "__main__":
     load_dotenv()
-    if len(sys.argv) < 2:
-        print("Usage: python sample.py <audio file> <azure|openai>")
-        print("If second argument is not provided, it will default to azure")
-        sys.exit(1)
-
-    file_path = sys.argv[1]
-    if len(sys.argv) == 3 and sys.argv[2] == "openai":
-        asyncio.run(with_openai(file_path))
-    else:
-        asyncio.run(with_azure_openai(file_path))
+    
+    root, audio_queue = create_gui()
+    root.mainloop()
